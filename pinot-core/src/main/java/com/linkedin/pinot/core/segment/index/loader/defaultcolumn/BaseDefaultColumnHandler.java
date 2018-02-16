@@ -303,8 +303,7 @@ public abstract class BaseDefaultColumnHandler implements DefaultColumnHandler {
 
     // Create dictionary.
     // We will have only one value in the dictionary.
-    try (SegmentDictionaryCreator creator = new SegmentDictionaryCreator(false/*hasNulls*/, sortedArray, fieldSpec,
-        _indexDir)) {
+    try (SegmentDictionaryCreator creator = new SegmentDictionaryCreator(sortedArray, fieldSpec, _indexDir)) {
       creator.build();
     }
 
