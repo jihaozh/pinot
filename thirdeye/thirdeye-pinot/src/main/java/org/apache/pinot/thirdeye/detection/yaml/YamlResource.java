@@ -19,9 +19,11 @@
 
 package org.apache.pinot.thirdeye.detection.yaml;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableMap;
+import org.apache.pinot.thirdeye.anomaly.task.TaskConstants;
 import org.apache.pinot.thirdeye.api.Constants;
 import org.apache.pinot.thirdeye.datalayer.bao.DatasetConfigManager;
 import org.apache.pinot.thirdeye.datalayer.bao.DetectionAlertConfigManager;
@@ -29,8 +31,10 @@ import org.apache.pinot.thirdeye.datalayer.bao.DetectionConfigManager;
 import org.apache.pinot.thirdeye.datalayer.bao.EventManager;
 import org.apache.pinot.thirdeye.datalayer.bao.MergedAnomalyResultManager;
 import org.apache.pinot.thirdeye.datalayer.bao.MetricConfigManager;
+import org.apache.pinot.thirdeye.datalayer.bao.TaskManager;
 import org.apache.pinot.thirdeye.datalayer.dto.DetectionAlertConfigDTO;
 import org.apache.pinot.thirdeye.datalayer.dto.DetectionConfigDTO;
+import org.apache.pinot.thirdeye.datalayer.dto.TaskDTO;
 import org.apache.pinot.thirdeye.datalayer.util.Predicate;
 import org.apache.pinot.thirdeye.datasource.DAORegistry;
 import org.apache.pinot.thirdeye.datasource.ThirdEyeCacheRegistry;
@@ -42,9 +46,8 @@ import org.apache.pinot.thirdeye.detection.DataProvider;
 import org.apache.pinot.thirdeye.detection.DefaultDataProvider;
 import org.apache.pinot.thirdeye.detection.DetectionPipelineLoader;
 import com.wordnik.swagger.annotations.Api;
-import com.wordnik.swagger.annotations.ApiImplicitParam;
-import com.wordnik.swagger.annotations.ApiImplicitParams;
 import com.wordnik.swagger.annotations.ApiOperation;
+import org.apache.pinot.thirdeye.detection.onboard.YamlOnboardingTaskInfo;
 import org.apache.pinot.thirdeye.detection.validators.DetectionAlertConfigValidator;
 import com.wordnik.swagger.annotations.ApiParam;
 import java.lang.reflect.InvocationTargetException;
@@ -54,6 +57,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
+import java.util.concurrent.TimeUnit;
 import javax.ws.rs.Consumes;
 import javax.ws.rs.GET;
 import javax.ws.rs.POST;
@@ -79,6 +83,7 @@ public class YamlResource {
 
   public static final String PROP_SUBS_GROUP_NAME = "subscriptionGroupName";
   public static final String PROP_DETECTION_NAME = "detectionName";
+  public static final long ONBOARDING_REPLAY_LOOKBACK = TimeUnit.DAYS.toMillis(30);
 
   private final DetectionConfigManager detectionConfigDAO;
   private final DetectionAlertConfigManager detectionAlertConfigDAO;
@@ -90,6 +95,7 @@ public class YamlResource {
   private final DatasetConfigManager datasetDAO;
   private final EventManager eventDAO;
   private final MergedAnomalyResultManager anomalyDAO;
+  private final TaskManager taskDAO;
   private final DetectionPipelineLoader loader;
   private final Yaml yaml;
 
@@ -103,6 +109,7 @@ public class YamlResource {
     this.datasetDAO = DAORegistry.getInstance().getDatasetConfigDAO();
     this.eventDAO = DAORegistry.getInstance().getEventDAO();
     this.anomalyDAO = DAORegistry.getInstance().getMergedAnomalyResultDAO();
+    this.taskDAO = DAORegistry.getInstance().getTaskDAO();
     this.yaml = new Yaml();
 
     TimeSeriesLoader timeseriesLoader =
@@ -183,7 +190,7 @@ public class YamlResource {
       return Response.serverError().entity(ImmutableMap.of("message", "Save detection alert config failed")).build();
     }
     LOG.info("saved detection alert config id {}", detectionAlertConfigId);
-
+    createYamlOnboardingTask(detectionConfigId, startTime, endTime);
     return Response.ok().entity(ImmutableMap.of("detectionConfigId", detectionConfig.getId(), "detectionAlertConfigId", alertConfig.getId())).build();
   }
 
@@ -213,6 +220,35 @@ public class YamlResource {
       responseMessage.put("message", e.getMessage());
     }
     return null;
+  }
+
+  /*
+   * Set up the yaml on-boarding task
+   */
+  private void createYamlOnboardingTask(long configId, long tuningWindowStart, long tuningWindowEnd){
+    YamlOnboardingTaskInfo info = new YamlOnboardingTaskInfo();
+    info.setConfigId(configId);
+    info.setTuningWindowStart(tuningWindowStart);
+    info.setTuningWindowEnd(tuningWindowEnd);
+    info.setEnd(System.currentTimeMillis());
+    info.setStart(info.getEnd() - ONBOARDING_REPLAY_LOOKBACK);
+
+    String taskInfoJson = null;
+    try {
+      taskInfoJson = OBJECT_MAPPER.writeValueAsString(info);
+    } catch (JsonProcessingException e) {
+      LOG.error("Exception when converting yaml detection onboarding {} to jsonString", info, e);
+    }
+    String jobName = String.format("%s_%d", TaskConstants.TaskType.YAML_DETECTION_ONBOARD, configId);
+
+    TaskDTO taskDTO = new TaskDTO();
+    taskDTO.setTaskType(TaskConstants.TaskType.YAML_DETECTION_ONBOARD);
+    taskDTO.setJobName(jobName);
+    taskDTO.setStatus(TaskConstants.TaskStatus.WAITING);
+    taskDTO.setTaskInfo(taskInfoJson);
+
+    long taskId = taskDAO.save(taskDTO);
+    LOG.info("Created yaml detection onboarding task {} with taskId {}", taskDTO, taskId);
   }
 
   /*
@@ -269,6 +305,7 @@ public class YamlResource {
     detectionConfig.setYaml(payload);
     Long detectionConfigId = this.detectionConfigDAO.save(detectionConfig);
     Preconditions.checkNotNull(detectionConfigId, "Save detection config failed");
+    createYamlOnboardingTask(detectionConfigId, startTime, endTime);
     return Response.ok(detectionConfig).build();
   }
 
